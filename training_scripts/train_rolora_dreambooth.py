@@ -49,6 +49,9 @@ from pathlib import Path
 import random
 import re
 
+from sam import SAM, disable_running_stats, enable_running_stats
+from StiefelOptimizers import StiefelSGD, StiefelAdam
+
 
 class DreamBoothDataset(Dataset):
     """
@@ -453,6 +456,16 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--use_xformers", action="store_true", help="Whether or not to use xformers"
     )
+    parser.add_argument("--ortho_init_down", action="store_true")
+    parser.add_argument("--gaussianize_ortho_init_down", type=str, default='sphere')
+    parser.add_argument("--stiefel_optim_down", action="store_true")
+    parser.add_argument("--down_lr_multiplier", type=float, default=1.)
+    # parser.add_argument("--maximize_down", action="store_true")
+    parser.add_argument("--how_to_optimize", type=str, default="minimize", choices=["minimize", "minimax", "minimax2", "sam"])
+    parser.add_argument("--sam_rho", type=float, default=0.05)
+    parser.add_argument("--sam_down_only", action="store_true")
+    parser.add_argument("--freeze_down", action="store_true")
+    parser.add_argument("--which_optim", type=str, default="adamw", choices=["adam", "adamw", "sgd"])
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -510,6 +523,73 @@ def sample_images(args, unet, text_encoder, prompts, global_step, n_samples=1, s
                       generator=torch.Generator('cuda').manual_seed(seed)).images
         grid = image_grid(images, rows=1, cols=n_samples)
         grid.save(f"{args.output_dir}/sample_{global_step}-{j}.png")
+
+
+def p_loss(args, unet, text_encoder, latents, input_ids, noise_scheduler):
+    # Sample noise that we'll add to the latents
+    noise = torch.randn_like(latents)
+    bsz = latents.shape[0]
+    # Sample a random timestep for each image
+    timesteps = torch.randint(
+        0,
+        noise_scheduler.config.num_train_timesteps,
+        (bsz,),
+        device=latents.device,
+    )
+    timesteps = timesteps.long()
+
+    # Add noise to the latents according to the noise magnitude at each timestep
+    # (this is the forward diffusion process)
+    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+    # Get the text embedding for conditioning
+    encoder_hidden_states = text_encoder(input_ids)[0]
+
+    # Predict the noise residual
+    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+
+    # Get the target for loss depending on the prediction type
+    if noise_scheduler.config.prediction_type == "epsilon":
+        target = noise
+    elif noise_scheduler.config.prediction_type == "v_prediction":
+        target = noise_scheduler.get_velocity(latents, noise, timesteps)
+    else:
+        raise ValueError(
+            f"Unknown prediction type {noise_scheduler.config.prediction_type}"
+        )
+
+    if args.with_prior_preservation:
+        # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+        model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+        target, target_prior = torch.chunk(target, 2, dim=0)
+
+        # Compute instance loss
+        loss = (
+            F.mse_loss(model_pred.float(), target.float(), reduction="none")
+            .mean([1, 2, 3])
+            .mean()
+        )
+
+        # Compute prior loss
+        prior_loss = F.mse_loss(
+            model_pred_prior.float(), target_prior.float(), reduction="mean"
+        )
+
+        # Add the prior loss to the instance loss.
+        # loss = loss + args.prior_loss_weight * prior_loss
+        return loss, prior_loss
+    else:
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+        return loss, 0.
+
+    # accelerator.backward(loss)
+    # if accelerator.sync_gradients:
+    #     params_to_clip = (
+    #         itertools.chain(unet.parameters(), text_encoder.parameters())
+    #         if args.train_text_encoder
+    #         else unet.parameters()
+    #     )
+    #     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
 
 def main(args):
@@ -625,6 +705,8 @@ def main(args):
     unet_lora_params, _ = inject_trainable_lora(
         unet, r=args.lora_rank, loras=args.resume_unet
     )
+    unet_lora_params_up = itertools.islice(unet_lora_params, 0, None, 2)
+    unet_lora_params_down = itertools.islice(unet_lora_params, 1, None, 2)
 
     for _up, _down in extract_lora_ups_down(unet):
         print("Before training: Unet First Layer lora up", _up.weight.data)
@@ -640,6 +722,8 @@ def main(args):
             target_replace_module=["CLIPAttention"],
             r=args.lora_rank,
         )
+        text_encoder_lora_params_up = itertools.islice(text_encoder_lora_params, 0, None, 2)
+        text_encoder_lora_params_down = itertools.islice(text_encoder_lora_params, 1, None, 2)
         for _up, _down in extract_lora_ups_down(
             text_encoder, target_replace_module=["CLIPAttention"]
         ):
@@ -667,17 +751,41 @@ def main(args):
         )
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
-    if args.use_8bit_adam:
-        try:
-            import bitsandbytes as bnb
-        except ImportError:
-            raise ImportError(
-                "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
-            )
+    # if args.use_8bit_adam:
+    #     try:
+    #         import bitsandbytes as bnb
+    #     except ImportError:
+    #         raise ImportError(
+    #             "To use 8-bit Adam, please install the bitsandbytes library: `pip install bitsandbytes`."
+    #         )
 
-        optimizer_class = bnb.optim.AdamW8bit
-    else:
+    #     optimizer_class = bnb.optim.AdamW8bit
+    # else:
+    #     optimizer_class = torch.optim.AdamW
+    if args.which_optim == 'adam':
+        optimizer_class = torch.optim.Adam
+        optim_args = dict(
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+        )
+    elif args.which_optim == 'adamw':
         optimizer_class = torch.optim.AdamW
+        optim_args = dict(
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+        )
+    elif args.which_optim == 'sgd':
+        optimizer_class = torch.optim.SGD
+        optim_args = dict(
+            lr=args.learning_rate,
+            momentum=args.adam_beta1,
+        )
+    else:
+        raise ValueError(f"Unknown optimizer {args.which_optim}")
 
     text_lr = (
         args.learning_rate
@@ -685,24 +793,146 @@ def main(args):
         else args.learning_rate_text
     )
 
-    params_to_optimize = (
+    # params_to_optimize = (
+    #     [
+    #         {"params": itertools.chain(*unet_lora_params), "lr": args.learning_rate},
+    #         {
+    #             "params": itertools.chain(*text_encoder_lora_params),
+    #             "lr": text_lr,
+    #         },
+    #     ]
+    #     if args.train_text_encoder
+    #     else itertools.chain(*unet_lora_params)
+    # )
+    # optimizer = optimizer_class(
+    #     params_to_optimize,
+    #     lr=args.learning_rate,
+    #     betas=(args.adam_beta1, args.adam_beta2),
+    #     weight_decay=args.adam_weight_decay,
+    #     eps=args.adam_epsilon,
+    # )
+    params_to_optimize_up = (
         [
-            {"params": itertools.chain(*unet_lora_params), "lr": args.learning_rate},
+            {"params": itertools.chain(*unet_lora_params_up), "lr": args.learning_rate},
+            {"params": itertools.chain(*text_encoder_lora_params_up), "lr": text_lr},
+        ]
+        if args.train_text_encoder
+        else itertools.chain(*unet_lora_params_up)
+    )
+    if args.how_to_optimize == 'sam':
+        optimizer_up = SAM(
+            params_to_optimize_up,
+            optimizer_class,
+            rho=args.sam_rho,
+            **optim_args,
+        )
+    else:
+        optimizer_up = optimizer_class(
+            params_to_optimize_up,
+            **optim_args,
+        )
+
+    # orthogonalize the down weights
+    unet_lora_params_down_list = list(itertools.chain(*unet_lora_params_down))
+    text_encoder_lora_params_down_list = list(itertools.chain(*text_encoder_lora_params_down)) if args.train_text_encoder else []
+    if args.ortho_init_down:
+        # for param in itertools.chain(*unet_lora_params_down):
+        for param in unet_lora_params_down_list + text_encoder_lora_params_down_list:
+            torch.nn.init.orthogonal_(param)
+            if args.gaussianize_ortho_init_down == 'sphere':
+                d = max(param.shape[0], param.shape[1])
+                param.data = param.data * (1./args.lora_rank * math.sqrt(d))
+            # elif args.gaussianize_ortho_init_down == 'gaussian':
+            #     if param.shape[0] == args.lora_rank:
+            #         rr = torch.randn(param.shape[0], 1, device=param.device)
+            #     else:
+            #         rr = torch.randn(1, param.shape[1], device=param.device)
+            #     param.data = param.data * rr
+        print("After orthogonalization")
+
+    # params_to_optimize_down = (
+    #     [
+    #         {"params": itertools.chain(*unet_lora_params_down), "lr": args.learning_rate * args.down_lr_multiplier},
+    #         {
+    #             "params": itertools.chain(*text_encoder_lora_params_down),
+    #             "lr": text_lr * args.down_lr_multiplier,
+    #         },
+    #     ]
+    #     if args.train_text_encoder
+    #     else itertools.chain(*unet_lora_params_down)
+    # )
+    params_to_optimize_down = (
+        [
+            {"params": unet_lora_params_down_list, "lr": args.learning_rate * args.down_lr_multiplier},
             {
-                "params": itertools.chain(*text_encoder_lora_params),
-                "lr": text_lr,
+                "params": text_encoder_lora_params_down_list,
+                "lr": text_lr * args.down_lr_multiplier,
             },
         ]
         if args.train_text_encoder
-        else itertools.chain(*unet_lora_params)
+        else unet_lora_params_down_list
     )
-    optimizer = optimizer_class(
-        params_to_optimize,
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
+    optim_args['lr'] = args.learning_rate * args.down_lr_multiplier
+    # if args.how_to_optimize == 'sam':
+    #     optimizer_down = SAM(
+    #         params_to_optimize_down,
+    #         optimizer_class,
+    #         rho=args.sam_rho,
+    #         **optim_args,
+    #     )
+    # elif args.stiefel_optim_down:
+    #     if args.which_optim == 'adam':
+    #         optimizer_down = StiefelAdam(
+    #             params_to_optimize_down,
+    #             **optim_args,
+    #         )
+    #     elif args.which_optim == 'sgd':
+    #         optimizer_down = StiefelSGD(
+    #             params_to_optimize_down,
+    #             **optim_args,
+    #         )
+    #     else:
+    #         raise ValueError(f"Unknown optimizer {args.which_optim}")
+    #     print("After StiefelOptimizer")
+    # else:
+    #     optimizer_down = optimizer_class(
+    #         params_to_optimize_down,
+    #         **optim_args,
+    #     )
+    #     print(f"Good old optimizer {args.which_optim}")
+    if args.stiefel_optim_down:
+        if args.which_optim == 'adam':
+            optimizer_down = StiefelAdam(
+                params_to_optimize_down,
+                **optim_args,
+            )
+            base_optimizer = StiefelAdam
+        elif args.which_optim == 'sgd':
+            optimizer_down = StiefelSGD(
+                params_to_optimize_down,
+                **optim_args,
+            )
+            base_optimizer = StiefelSGD
+        else:
+            raise ValueError(f"Unknown optimizer {args.which_optim}")
+        print("After StiefelOptimizer")
+    else:
+        optimizer_down = optimizer_class(
+            params_to_optimize_down,
+            **optim_args,
+        )
+        base_optimizer = optimizer_class
+        print(f"Good old optimizer {args.which_optim}")
+    if args.how_to_optimize == 'sam':
+        optimizer_down = SAM(
+            params_to_optimize_down,
+            base_optimizer,
+            rho=args.sam_rho,
+            **optim_args,
+        )
+    
+    print(optimizer_up)
+    print(optimizer_down)
 
     noise_scheduler = DDPMScheduler.from_config(
         args.pretrained_model_name_or_path, subfolder="scheduler"
@@ -763,9 +993,15 @@ def main(args):
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler = get_scheduler(
+    lr_scheduler_up = get_scheduler(
         args.lr_scheduler,
-        optimizer=optimizer,
+        optimizer=optimizer_up,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+    )
+    lr_scheduler_down = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer_down,
         num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
@@ -774,15 +1010,27 @@ def main(args):
         (
             unet,
             text_encoder,
-            optimizer,
+            optimizer_up, optimizer_down,
             train_dataloader,
-            lr_scheduler,
+            lr_scheduler_up, lr_scheduler_down,
         ) = accelerator.prepare(
-            unet, text_encoder, optimizer, train_dataloader, lr_scheduler
+            unet,
+            text_encoder,
+            optimizer_up, optimizer_down,
+            train_dataloader,
+            lr_scheduler_up, lr_scheduler_down,
         )
     else:
-        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, train_dataloader, lr_scheduler
+        (
+            unet,
+            optimizer_up, optimizer_down,
+            train_dataloader,
+            lr_scheduler_up, lr_scheduler_down,
+        ) = accelerator.prepare(
+            unet,
+            optimizer_up, optimizer_down,
+            train_dataloader,
+            lr_scheduler_up, lr_scheduler_down,
         )
 
     weight_dtype = torch.float32
@@ -849,73 +1097,141 @@ def main(args):
             ).latent_dist.sample()
             latents = latents * 0.18215
 
-            # Sample noise that we'll add to the latents
-            noise = torch.randn_like(latents)
-            bsz = latents.shape[0]
-            # Sample a random timestep for each image
-            timesteps = torch.randint(
-                0,
-                noise_scheduler.config.num_train_timesteps,
-                (bsz,),
-                device=latents.device,
-            )
-            timesteps = timesteps.long()
+            # # Sample noise that we'll add to the latents
+            # noise = torch.randn_like(latents)
+            # bsz = latents.shape[0]
+            # # Sample a random timestep for each image
+            # timesteps = torch.randint(
+            #     0,
+            #     noise_scheduler.config.num_train_timesteps,
+            #     (bsz,),
+            #     device=latents.device,
+            # )
+            # timesteps = timesteps.long()
 
-            # Add noise to the latents according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            # # Add noise to the latents according to the noise magnitude at each timestep
+            # # (this is the forward diffusion process)
+            # noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-            # Get the text embedding for conditioning
-            encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+            # # Get the text embedding for conditioning
+            # encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
-            # Predict the noise residual
-            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+            # # Predict the noise residual
+            # model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
 
-            # Get the target for loss depending on the prediction type
-            if noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif noise_scheduler.config.prediction_type == "v_prediction":
-                target = noise_scheduler.get_velocity(latents, noise, timesteps)
-            else:
-                raise ValueError(
-                    f"Unknown prediction type {noise_scheduler.config.prediction_type}"
-                )
+            # # Get the target for loss depending on the prediction type
+            # if noise_scheduler.config.prediction_type == "epsilon":
+            #     target = noise
+            # elif noise_scheduler.config.prediction_type == "v_prediction":
+            #     target = noise_scheduler.get_velocity(latents, noise, timesteps)
+            # else:
+            #     raise ValueError(
+            #         f"Unknown prediction type {noise_scheduler.config.prediction_type}"
+            #     )
 
-            if args.with_prior_preservation:
-                # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-                model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
-                target, target_prior = torch.chunk(target, 2, dim=0)
+            # if args.with_prior_preservation:
+            #     # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
+            #     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
+            #     target, target_prior = torch.chunk(target, 2, dim=0)
 
-                # Compute instance loss
-                loss = (
-                    F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                    .mean([1, 2, 3])
-                    .mean()
-                )
+            #     # Compute instance loss
+            #     loss = (
+            #         F.mse_loss(model_pred.float(), target.float(), reduction="none")
+            #         .mean([1, 2, 3])
+            #         .mean()
+            #     )
 
-                # Compute prior loss
-                prior_loss = F.mse_loss(
-                    model_pred_prior.float(), target_prior.float(), reduction="mean"
-                )
+            #     # Compute prior loss
+            #     prior_loss = F.mse_loss(
+            #         model_pred_prior.float(), target_prior.float(), reduction="mean"
+            #     )
 
-                # Add the prior loss to the instance loss.
-                loss = loss + args.prior_loss_weight * prior_loss
-            else:
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            #     # Add the prior loss to the instance loss.
+            #     loss = loss + args.prior_loss_weight * prior_loss
+            # else:
+            #     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
-            accelerator.backward(loss)
-            if accelerator.sync_gradients:
-                params_to_clip = (
-                    itertools.chain(unet.parameters(), text_encoder.parameters())
-                    if args.train_text_encoder
-                    else unet.parameters()
-                )
-                accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-            optimizer.step()
-            lr_scheduler.step()
+            if args.how_to_optimize == "sam":
+                enable_running_stats(unet)
+                enable_running_stats(text_encoder)
+                loss, prior_loss = p_loss(args, unet, text_encoder, latents, batch["input_ids"], noise_scheduler)
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = (
+                        itertools.chain(unet.parameters(), text_encoder.parameters())
+                        if args.train_text_encoder
+                        else unet.parameters()
+                    )
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                if not args.sam_down_only:
+                    optimizer_up.optimizer.first_step(zero_grad=True)
+                if not args.freeze_down:
+                    optimizer_down.optimizer.first_step(zero_grad=True)
+
+                disable_running_stats(unet)
+                disable_running_stats(text_encoder)
+                loss, prior_loss = p_loss(args, unet, text_encoder, latents, batch["input_ids"], noise_scheduler)
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = (
+                        itertools.chain(unet.parameters(), text_encoder.parameters())
+                        if args.train_text_encoder
+                        else unet.parameters()
+                    )
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                optimizer_up.optimizer.second_step(zero_grad=True)
+                if not args.freeze_down:
+                    optimizer_down.optimizer.second_step(zero_grad=True)
+
+            elif args.how_to_optimize == "minimax" or args.how_to_optimize == "minimax2":
+
+                loss, prior_loss = p_loss(args, unet, text_encoder, latents, batch["input_ids"], noise_scheduler)
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = (
+                        itertools.chain(unet.parameters(), text_encoder.parameters())
+                        if args.train_text_encoder
+                        else unet.parameters()
+                    )
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                optimizer_up.step()
+                optimizer_up.zero_grad()
+                if args.how_to_optimize == "minimax2":
+                    optimizer_down.step()
+                    optimizer_down.zero_grad()
+                
+                loss, prior_loss = p_loss(args, unet, text_encoder, latents, batch["input_ids"], noise_scheduler)
+                accelerator.backward(-loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = (
+                        itertools.chain(unet.parameters(), text_encoder.parameters())
+                        if args.train_text_encoder
+                        else unet.parameters()
+                    )
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                optimizer_down.step()
+                optimizer_down.zero_grad()
+
+            elif args.how_to_optimize == "minimize":
+                loss, prior_loss = p_loss(args, unet, text_encoder, latents, batch["input_ids"], noise_scheduler)
+                # accelerator.backward(loss + args.prior_loss_weight * prior_loss)
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    params_to_clip = (
+                        itertools.chain(unet.parameters(), text_encoder.parameters())
+                        if args.train_text_encoder
+                        else unet.parameters()
+                    )
+                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
+                optimizer_up.step()
+                if not args.freeze_down:
+                    optimizer_down.step()
+                optimizer_up.zero_grad()
+                optimizer_down.zero_grad()
+
+            lr_scheduler_up.step()
+            lr_scheduler_down.step()
             progress_bar.update(1)
-            optimizer.zero_grad()
-
             global_step += 1
 
             # Checks if the accelerator has performed an optimization step behind the scenes
@@ -985,7 +1301,7 @@ def main(args):
 
                         last_save = global_step
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler_up.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 
