@@ -9,10 +9,3 @@ exps*
 .vscode
 build
 lora_diffusion.egg-info
-images*/
-images
-images_db
-images_class
-outputs/
-logs/
-*.sh

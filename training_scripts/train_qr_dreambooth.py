@@ -5,7 +5,7 @@ import argparse
 import hashlib
 import itertools
 import math
-import os
+import os,sys
 import inspect
 from pathlib import Path
 from typing import Optional
@@ -37,6 +37,7 @@ from lora_diffusion import (
     save_lora_weight,
     save_safeloras,
 )
+from lora_diffusion.lora import inject_trainable_kron_qr, inject_trainable_qr
 from lora_diffusion.xformers_utils import set_use_memory_efficient_attention_xformers
 from PIL import Image
 from torch.utils.data import Dataset
@@ -262,7 +263,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--output_format",
         type=str,
-        choices=["pt", "safe", "both"],
+        choices=["pt", "safe", "both","None"],
         default="both",
         help="The output format of the model predicitions and checkpoints.",
     )
@@ -456,9 +457,15 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--use_xformers", action="store_true", help="Whether or not to use xformers"
     )
+    parser.add_argument("--ortho_init_up", action="store_true")
     parser.add_argument("--ortho_init_down", action="store_true")
+    parser.add_argument("--zero_init_down", action="store_true")
+    parser.add_argument("--triangle_down", action="store_true")
+    parser.add_argument("--gaussianize_ortho_init_up", type=str, default='sphere')
     parser.add_argument("--gaussianize_ortho_init_down", type=str, default='sphere')
+    parser.add_argument("--stiefel_optim_up", action="store_true")
     parser.add_argument("--stiefel_optim_down", action="store_true")
+    parser.add_argument("--up_lr_multiplier", type=float, default=1.)
     parser.add_argument("--down_lr_multiplier", type=float, default=1.)
     # parser.add_argument("--maximize_down", action="store_true")
     parser.add_argument("--how_to_optimize", type=str, default="minimize", choices=["minimize", "minimax", "minimax2", "sam"])
@@ -466,6 +473,17 @@ def parse_args(input_args=None):
     parser.add_argument("--sam_down_only", action="store_true")
     parser.add_argument("--freeze_down", action="store_true")
     parser.add_argument("--which_optim", type=str, default="adamw", choices=["adam", "adamw", "sgd"])
+    parser.add_argument("--factorization", type=str, default="qr", choices=["kron_qr", "lora","qr"])
+    parser.add_argument("--stiefel_optim_kron_1", action="store_true")
+    parser.add_argument("--stiefel_optim_kron_2", action="store_true")
+    parser.add_argument("--stiefel_optim_qr_q", action="store_true")
+    parser.add_argument("--stiefel_optim_qr_r", action="store_true")
+    parser.add_argument("--kron_1_lr_multiplier", type=float, default=1.)
+    parser.add_argument("--kron_2_lr_multiplier", type=float, default=1.)
+    parser.add_argument("--qr_q_lr_multiplier", type=float, default=1.)
+    parser.add_argument("--qr_r_lr_multiplier", type=float, default=1.)
+    parser.add_argument("--size_kron_1", type=int, default=4)
+    parser.add_argument("--size_qr_r", type=int, default=4)   
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -702,36 +720,73 @@ def main(args):
         revision=args.revision,
     )
     unet.requires_grad_(False)
-    unet_lora_params, _ = inject_trainable_lora(
-        unet, r=args.lora_rank, loras=args.resume_unet
-    )
-    unet_lora_params_up = itertools.islice(unet_lora_params, 0, None, 2)
-    unet_lora_params_down = itertools.islice(unet_lora_params, 1, None, 2)
 
-    for _up, _down in extract_lora_ups_down(unet):
-        print("Before training: Unet First Layer lora up", _up.weight.data)
-        print("Before training: Unet First Layer lora down", _down.weight.data)
-        break
+    if args.factorization == 'lora':
+        unet_lora_params, _ = inject_trainable_lora(
+            unet, r=args.lora_rank, loras=args.resume_unet
+        )
+        unet_lora_params_up = itertools.islice(unet_lora_params, 0, None, 2)
+        unet_lora_params_down = itertools.islice(unet_lora_params, 1, None, 2)
+
+    if args.factorization == 'kron_qr':
+        unet_kron_qr_params, _ = inject_trainable_kron_qr(
+            unet, size_kron_1=args.size_kron_1
+        )
+        unet_kron_qr_params_kron_1 = itertools.islice(unet_kron_qr_params, 0, None, 3)
+        unet_kron_qr_params_kron_2 = itertools.islice(unet_kron_qr_params, 1, None, 3)
+        unet_kron_qr_params_qr_r = itertools.islice(unet_kron_qr_params, 2, None, 3)
+
+    if args.factorization == 'lora':
+        for _up, _down in extract_lora_ups_down(unet):
+            print("Before training: Unet First Layer lora up", _up.weight.data)
+            print("Before training: Unet First Layer lora down", _down.weight.data)
+            break
+
+    if args.factorization == 'qr':
+        unet_qr_params, _ = inject_trainable_qr(
+            unet,
+        )
+        unet_qr_params_qr_q = itertools.islice(unet_qr_params, 0, None, 2)
+        unet_qr_params_qr_r = itertools.islice(unet_qr_params, 1, None, 2)   
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
 
     if args.train_text_encoder:
-        text_encoder_lora_params, _ = inject_trainable_lora(
-            text_encoder,
-            target_replace_module=["CLIPAttention"],
-            r=args.lora_rank,
-        )
-        text_encoder_lora_params_up = itertools.islice(text_encoder_lora_params, 0, None, 2)
-        text_encoder_lora_params_down = itertools.islice(text_encoder_lora_params, 1, None, 2)
-        for _up, _down in extract_lora_ups_down(
-            text_encoder, target_replace_module=["CLIPAttention"]
-        ):
-            print("Before training: text encoder First Layer lora up", _up.weight.data)
-            print(
-                "Before training: text encoder First Layer lora down", _down.weight.data
+        if args.factorization == 'lora':
+            text_encoder_lora_params, _ = inject_trainable_lora(
+                text_encoder,
+                target_replace_module=["CLIPAttention"],
+                r=args.lora_rank,
             )
-            break
+            text_encoder_lora_params_up = itertools.islice(text_encoder_lora_params, 0, None, 2)
+            text_encoder_lora_params_down = itertools.islice(text_encoder_lora_params, 1, None, 2)
+            for _up, _down in extract_lora_ups_down(
+                text_encoder, target_replace_module=["CLIPAttention"]
+            ):
+                print("Before training: text encoder First Layer lora up", _up.weight.data)
+                print(
+                    "Before training: text encoder First Layer lora down", _down.weight.data
+                )
+                break
+        
+        if args.factorization == 'kron_qr':
+            text_encoder_kron_qr_params, _ = inject_trainable_kron_qr(
+                text_encoder,
+                target_replace_module=["CLIPAttention"],
+                size_kron_1=args.size_kron_1
+            )
+            text_encoder_kron_qr_params_kron_1 = itertools.islice(text_encoder_kron_qr_params, 0, None, 3)
+            text_encoder_kron_qr_params_kron_2 = itertools.islice(text_encoder_kron_qr_params, 1, None, 3)
+            text_encoder_kron_qr_params_qr_r = itertools.islice(text_encoder_kron_qr_params, 2, None, 3)       
+
+        if args.factorization == 'qr':
+            text_encoder_qr_params, _ = inject_trainable_qr(
+                text_encoder,
+                target_replace_module=["CLIPAttention"],
+            )
+            text_encoder_qr_params_qr_q = itertools.islice(text_encoder_qr_params, 0, None, 2)
+            text_encoder_qr_params_qr_r = itertools.islice(text_encoder_qr_params, 1, None, 2)       
 
     if args.use_xformers:
         set_use_memory_efficient_attention_xformers(unet, True)
@@ -793,146 +848,303 @@ def main(args):
         else args.learning_rate_text
     )
 
-    # params_to_optimize = (
-    #     [
-    #         {"params": itertools.chain(*unet_lora_params), "lr": args.learning_rate},
-    #         {
-    #             "params": itertools.chain(*text_encoder_lora_params),
-    #             "lr": text_lr,
-    #         },
-    #     ]
-    #     if args.train_text_encoder
-    #     else itertools.chain(*unet_lora_params)
-    # )
-    # optimizer = optimizer_class(
-    #     params_to_optimize,
-    #     lr=args.learning_rate,
-    #     betas=(args.adam_beta1, args.adam_beta2),
-    #     weight_decay=args.adam_weight_decay,
-    #     eps=args.adam_epsilon,
-    # )
-    params_to_optimize_up = (
-        [
-            {"params": itertools.chain(*unet_lora_params_up), "lr": args.learning_rate},
-            {"params": itertools.chain(*text_encoder_lora_params_up), "lr": text_lr},
-        ]
-        if args.train_text_encoder
-        else itertools.chain(*unet_lora_params_up)
-    )
-    if args.how_to_optimize == 'sam':
-        optimizer_up = SAM(
-            params_to_optimize_up,
-            optimizer_class,
-            rho=args.sam_rho,
-            **optim_args,
-        )
-    else:
-        optimizer_up = optimizer_class(
-            params_to_optimize_up,
-            **optim_args,
+    if args.factorization == 'kron_qr':
+        # orthogonalize the kron1 weights
+        unet_kron_qr_params_kron_1_list = list(itertools.chain(*unet_kron_qr_params_kron_1))
+        text_encoder_kron_qr_params_kron_1_list = list(itertools.chain(*text_encoder_kron_qr_params_kron_1)) if args.train_text_encoder else []
+        '''
+        if args.ortho_init_kron_1:
+            for param in unet_kron_qr_params_kron_1_list + text_encoder_kron_qr_params_kron_1_list:
+                torch.nn.init.orthogonal_(param)
+                if args.gaussianize_ortho_init_up == 'sphere':
+                    d = max(param.shape[0], param.shape[1])
+                    param.data = param.data * (1./args.lora_rank * math.sqrt(d))
+            print("After orthogonalization")
+        '''
+        params_to_optimize_kron_1 = (
+            [
+                {"params": unet_kron_qr_params_kron_1_list, "lr": args.learning_rate * args.kron_1_lr_multiplier},
+                {"params": text_encoder_kron_qr_params_kron_1_list, "lr": text_lr * args.kron_1_lr_multiplier},
+            ]
+            if args.train_text_encoder
+            else unet_kron_qr_params_kron_1_list
         )
 
-    # orthogonalize the down weights
-    unet_lora_params_down_list = list(itertools.chain(*unet_lora_params_down))
-    text_encoder_lora_params_down_list = list(itertools.chain(*text_encoder_lora_params_down)) if args.train_text_encoder else []
-    if args.ortho_init_down:
-        # for param in itertools.chain(*unet_lora_params_down):
-        for param in unet_lora_params_down_list + text_encoder_lora_params_down_list:
-            torch.nn.init.orthogonal_(param)
-            if args.gaussianize_ortho_init_down == 'sphere':
-                d = max(param.shape[0], param.shape[1])
-                param.data = param.data * (1./args.lora_rank * math.sqrt(d))
-            # elif args.gaussianize_ortho_init_down == 'gaussian':
-            #     if param.shape[0] == args.lora_rank:
-            #         rr = torch.randn(param.shape[0], 1, device=param.device)
-            #     else:
-            #         rr = torch.randn(1, param.shape[1], device=param.device)
-            #     param.data = param.data * rr
-        print("After orthogonalization")
+        optim_args['lr'] = args.learning_rate * args.kron_1_lr_multiplier
 
-    # params_to_optimize_down = (
-    #     [
-    #         {"params": itertools.chain(*unet_lora_params_down), "lr": args.learning_rate * args.down_lr_multiplier},
-    #         {
-    #             "params": itertools.chain(*text_encoder_lora_params_down),
-    #             "lr": text_lr * args.down_lr_multiplier,
-    #         },
-    #     ]
-    #     if args.train_text_encoder
-    #     else itertools.chain(*unet_lora_params_down)
-    # )
-    params_to_optimize_down = (
-        [
-            {"params": unet_lora_params_down_list, "lr": args.learning_rate * args.down_lr_multiplier},
-            {
-                "params": text_encoder_lora_params_down_list,
-                "lr": text_lr * args.down_lr_multiplier,
-            },
-        ]
-        if args.train_text_encoder
-        else unet_lora_params_down_list
-    )
-    optim_args['lr'] = args.learning_rate * args.down_lr_multiplier
-    # if args.how_to_optimize == 'sam':
-    #     optimizer_down = SAM(
-    #         params_to_optimize_down,
-    #         optimizer_class,
-    #         rho=args.sam_rho,
-    #         **optim_args,
-    #     )
-    # elif args.stiefel_optim_down:
-    #     if args.which_optim == 'adam':
-    #         optimizer_down = StiefelAdam(
-    #             params_to_optimize_down,
-    #             **optim_args,
-    #         )
-    #     elif args.which_optim == 'sgd':
-    #         optimizer_down = StiefelSGD(
-    #             params_to_optimize_down,
-    #             **optim_args,
-    #         )
-    #     else:
-    #         raise ValueError(f"Unknown optimizer {args.which_optim}")
-    #     print("After StiefelOptimizer")
-    # else:
-    #     optimizer_down = optimizer_class(
-    #         params_to_optimize_down,
-    #         **optim_args,
-    #     )
-    #     print(f"Good old optimizer {args.which_optim}")
-    if args.stiefel_optim_down:
-        if args.which_optim == 'adam':
-            optimizer_down = StiefelAdam(
-                params_to_optimize_down,
-                **optim_args,
-            )
-            base_optimizer = StiefelAdam
-        elif args.which_optim == 'sgd':
-            optimizer_down = StiefelSGD(
-                params_to_optimize_down,
-                **optim_args,
-            )
-            base_optimizer = StiefelSGD
+        if args.stiefel_optim_kron_1:
+            if args.which_optim == 'adam':
+                optimizer_kron_1 = StiefelAdam(
+                    params_to_optimize_kron_1,
+                    **optim_args,
+                )
+                base_optimizer = StiefelAdam
+            elif args.which_optim == 'sgd':
+                optimizer_kron_1 = StiefelSGD(
+                    params_to_optimize_kron_1,
+                    **optim_args,
+                )
+                base_optimizer = StiefelSGD
+            else:
+                raise ValueError(f"Unknown optimizer {args.which_optim}")
+            print("After StiefelOptimizer")
         else:
-            raise ValueError(f"Unknown optimizer {args.which_optim}")
-        print("After StiefelOptimizer")
-    else:
-        optimizer_down = optimizer_class(
-            params_to_optimize_down,
-            **optim_args,
+            optimizer_kron_1 = optimizer_class(
+                params_to_optimize_kron_1,
+                **optim_args,
+            )
+            base_optimizer = optimizer_class
+            print(f"Good old optimizer {args.which_optim}")
+        if args.how_to_optimize == 'sam':
+            optimizer_kron_1 = SAM(
+                params_to_optimize_kron_1,
+                base_optimizer,
+                rho=args.sam_rho,
+                **optim_args,
+            )
+
+
+        # orthogonalize the kron2 weights
+        unet_kron_qr_params_kron_2_list = list(itertools.chain(*unet_kron_qr_params_kron_2))
+        text_encoder_kron_qr_params_kron_2_list = list(itertools.chain(*text_encoder_kron_qr_params_kron_2)) if args.train_text_encoder else []
+        '''
+        if args.ortho_init_kron_2:
+            for param in unet_kron_qr_params_kron_2_list + text_encoder_kron_qr_params_kron_2_list:
+                torch.nn.init.orthogonal_(param)
+                if args.gaussianize_ortho_init_up == 'sphere':
+                    d = max(param.shape[0], param.shape[1])
+                    param.data = param.data * (1./args.lora_rank * math.sqrt(d))
+            print("After orthogonalization")
+        '''
+        params_to_optimize_kron_2 = (
+            [
+                {"params": unet_kron_qr_params_kron_2_list, "lr": args.learning_rate * args.kron_2_lr_multiplier},
+                {"params": text_encoder_kron_qr_params_kron_2_list, "lr": text_lr * args.kron_2_lr_multiplier},
+            ]
+            if args.train_text_encoder
+            else unet_kron_qr_params_kron_2_list
         )
-        base_optimizer = optimizer_class
-        print(f"Good old optimizer {args.which_optim}")
-    if args.how_to_optimize == 'sam':
-        optimizer_down = SAM(
-            params_to_optimize_down,
-            base_optimizer,
-            rho=args.sam_rho,
-            **optim_args,
+
+        optim_args['lr'] = args.learning_rate * args.kron_2_lr_multiplier
+
+        if args.stiefel_optim_kron_2:
+            if args.which_optim == 'adam':
+                optimizer_kron_2 = StiefelAdam(
+                    params_to_optimize_kron_2,
+                    **optim_args,
+                )
+                base_optimizer = StiefelAdam
+            elif args.which_optim == 'sgd':
+                optimizer_kron_2 = StiefelSGD(
+                    params_to_optimize_kron_2,
+                    **optim_args,
+                )
+                base_optimizer = StiefelSGD
+            else:
+                raise ValueError(f"Unknown optimizer {args.which_optim}")
+            print("After StiefelOptimizer")
+        else:
+            optimizer_kron_2 = optimizer_class(
+                params_to_optimize_kron_2,
+                **optim_args,
+            )
+            base_optimizer = optimizer_class
+            print(f"Good old optimizer {args.which_optim}")
+        if args.how_to_optimize == 'sam':
+            optimizer_kron_2 = SAM(
+                params_to_optimize_kron_2,
+                base_optimizer,
+                rho=args.sam_rho,
+                **optim_args,
+            )
+            
+
+        # orthogonalize the qr_r weights
+        unet_kron_qr_params_qr_r_list = list(itertools.chain(*unet_kron_qr_params_qr_r))
+        text_encoder_kron_qr_params_qr_r_list = list(itertools.chain(*text_encoder_kron_qr_params_qr_r)) if args.train_text_encoder else []
+        '''
+        if args.ortho_init_qr_r:
+            for param in unet_kron_qr_params_qr_r_list + text_encoder_kron_qr_params_qr_r_list:
+                torch.nn.init.orthogonal_(param)
+                if args.gaussianize_ortho_init_up == 'sphere':
+                    d = max(param.shape[0], param.shape[1])
+                    param.data = param.data * (1./args.lora_rank * math.sqrt(d))
+            print("After orthogonalization")
+        '''
+        params_to_optimize_qr_r = (
+            [
+                {"params": unet_kron_qr_params_qr_r_list, "lr": args.learning_rate * args.qr_r_lr_multiplier},
+                {"params": text_encoder_kron_qr_params_qr_r_list, "lr": text_lr * args.qr_r_lr_multiplier},
+            ]
+            if args.train_text_encoder
+            else unet_kron_qr_params_qr_r_list
         )
-    
-    print(optimizer_up)
-    print(optimizer_down)
+
+        optim_args['lr'] = args.learning_rate * args.qr_r_lr_multiplier
+
+        if args.stiefel_optim_qr_r:
+            if args.which_optim == 'adam':
+                optimizer_qr_r = StiefelAdam(
+                    params_to_optimize_qr_r,
+                    **optim_args,
+                )
+                base_optimizer = StiefelAdam
+            elif args.which_optim == 'sgd':
+                optimizer_qr_r = StiefelSGD(
+                    params_to_optimize_qr_r,
+                    **optim_args,
+                )
+                base_optimizer = StiefelSGD
+            else:
+                raise ValueError(f"Unknown optimizer {args.which_optim}")
+            print("After StiefelOptimizer")
+        else:
+            optimizer_qr_r = optimizer_class(
+                params_to_optimize_qr_r,
+                **optim_args,
+            )
+            base_optimizer = optimizer_class
+            print(f"Good old optimizer {args.which_optim}")
+        if args.how_to_optimize == 'sam':
+            optimizer_qr_r = SAM(
+                params_to_optimize_qr_r,
+                base_optimizer,
+                rho=args.sam_rho,
+                **optim_args,
+            )
+
+        
+        print(optimizer_kron_1)
+        print(optimizer_kron_2)
+        print(optimizer_qr_r)
+
+    if args.factorization == 'qr':
+        # orthogonalize the qr_q weights
+        unet_qr_params_qr_q_list = list(itertools.chain(*unet_qr_params_qr_q))
+        text_encoder_qr_params_qr_q_list = list(itertools.chain(*text_encoder_qr_params_qr_q)) if args.train_text_encoder else []
+        '''
+        if args.ortho_init_qr_r:
+            for param in unet_kron_qr_params_qr_r_list + text_encoder_kron_qr_params_qr_r_list:
+                torch.nn.init.orthogonal_(param)
+                if args.gaussianize_ortho_init_up == 'sphere':
+                    d = max(param.shape[0], param.shape[1])
+                    param.data = param.data * (1./args.lora_rank * math.sqrt(d))
+            print("After orthogonalization")
+        '''
+        params_to_optimize_qr_q = (
+            [
+                {"params": unet_qr_params_qr_q_list, "lr": args.learning_rate * args.qr_q_lr_multiplier},
+                {"params": text_encoder_qr_params_qr_q_list, "lr": text_lr * args.qr_q_lr_multiplier},
+            ]
+            if args.train_text_encoder
+            else text_encoder_qr_params_qr_q_list
+        )
+
+        optim_args['lr'] = args.learning_rate * args.qr_q_lr_multiplier
+
+        if args.stiefel_optim_qr_q:
+            if args.which_optim == 'adam':
+                optimizer_qr_q = StiefelAdam(
+                    params_to_optimize_qr_q,
+                    **optim_args,
+                )
+                base_optimizer = StiefelAdam
+            elif args.which_optim == 'sgd':
+                optimizer_qr_q = StiefelSGD(
+                    params_to_optimize_qr_q,
+                    **optim_args,
+                )
+                base_optimizer = StiefelSGD
+            else:
+                raise ValueError(f"Unknown optimizer {args.which_optim}")
+            print("After StiefelOptimizer")
+        else:
+            optimizer_qr_q = optimizer_class(
+                params_to_optimize_qr_q,
+                **optim_args,
+            )
+            base_optimizer = optimizer_class
+            print(f"Good old optimizer {args.which_optim}")
+        if args.how_to_optimize == 'sam':
+            optimizer_qr_q = SAM(
+                params_to_optimize_qr_q,
+                base_optimizer,
+                rho=args.sam_rho,
+                **optim_args,
+            )
+
+        # orthogonalize the qr_r weights
+        unet_qr_params_qr_r_list = list(itertools.chain(*unet_qr_params_qr_r))
+        text_encoder_qr_params_qr_r_list = list(itertools.chain(*text_encoder_qr_params_qr_r)) if args.train_text_encoder else []
+        '''
+        if args.ortho_init_qr_r:
+            for param in unet_kron_qr_params_qr_r_list + text_encoder_kron_qr_params_qr_r_list:
+                torch.nn.init.orthogonal_(param)
+                if args.gaussianize_ortho_init_up == 'sphere':
+                    d = max(param.shape[0], param.shape[1])
+                    param.data = param.data * (1./args.lora_rank * math.sqrt(d))
+            print("After orthogonalization")
+        '''
+        params_to_optimize_qr_r = (
+            [
+                {"params": unet_qr_params_qr_r_list, "lr": args.learning_rate * args.qr_r_lr_multiplier},
+                {"params": text_encoder_qr_params_qr_r_list, "lr": text_lr * args.qr_r_lr_multiplier},
+            ]
+            if args.train_text_encoder
+            else unet_qr_params_qr_r_list
+        )
+
+        optim_args['lr'] = args.learning_rate * args.qr_r_lr_multiplier
+
+        if args.stiefel_optim_qr_r:
+            if args.which_optim == 'adam':
+                optimizer_qr_r = StiefelAdam(
+                    params_to_optimize_qr_r,
+                    **optim_args,
+                )
+                base_optimizer = StiefelAdam
+            elif args.which_optim == 'sgd':
+                optimizer_qr_r = StiefelSGD(
+                    params_to_optimize_qr_r,
+                    **optim_args,
+                )
+                base_optimizer = StiefelSGD
+            else:
+                raise ValueError(f"Unknown optimizer {args.which_optim}")
+            print("After StiefelOptimizer")
+        else:
+            optimizer_qr_r = optimizer_class(
+                params_to_optimize_qr_r,
+                **optim_args,
+            )
+            base_optimizer = optimizer_class
+            print(f"Good old optimizer {args.which_optim}")
+        if args.how_to_optimize == 'sam':
+            optimizer_qr_r = SAM(
+                params_to_optimize_qr_r,
+                base_optimizer,
+                rho=args.sam_rho,
+                **optim_args,
+            )    
+
+        print(optimizer_qr_q)
+        print(optimizer_qr_r)
+
+    if args.factorization == 'lora':
+        for _up, _down in extract_lora_ups_down(unet):
+            print("After init: Unet First Layer lora up", _up.weight.data)
+            print("After init: Unet First Layer lora down", _down.weight.data)
+            break
+
+        if args.train_text_encoder:
+            for _up, _down in extract_lora_ups_down(
+                text_encoder, target_replace_module=["CLIPAttention"]
+            ):
+                print("After init: text encoder First Layer lora up", _up.weight.data)
+                print(
+                    "After init: text encoder First Layer lora down", _down.weight.data
+                )
+                break
 
     noise_scheduler = DDPMScheduler.from_config(
         args.pretrained_model_name_or_path, subfolder="scheduler"
@@ -993,45 +1205,98 @@ def main(args):
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler_up = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer_up,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-    )
-    lr_scheduler_down = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer_down,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
-    )
+    if args.factorization == 'kron_qr':
+        lr_scheduler_kron_1 = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer_kron_1,
+            num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        )
 
-    if args.train_text_encoder:
-        (
-            unet,
-            text_encoder,
-            optimizer_up, optimizer_down,
-            train_dataloader,
-            lr_scheduler_up, lr_scheduler_down,
-        ) = accelerator.prepare(
-            unet,
-            text_encoder,
-            optimizer_up, optimizer_down,
-            train_dataloader,
-            lr_scheduler_up, lr_scheduler_down,
+        lr_scheduler_kron_2 = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer_kron_2,
+            num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
         )
-    else:
-        (
-            unet,
-            optimizer_up, optimizer_down,
-            train_dataloader,
-            lr_scheduler_up, lr_scheduler_down,
-        ) = accelerator.prepare(
-            unet,
-            optimizer_up, optimizer_down,
-            train_dataloader,
-            lr_scheduler_up, lr_scheduler_down,
+
+        lr_scheduler_qr_r = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer_qr_r,
+            num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
         )
+
+    if args.factorization == 'qr':
+        lr_scheduler_qr_q = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer_qr_q,
+            num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        )       
+
+        lr_scheduler_qr_r = get_scheduler(
+            args.lr_scheduler,
+            optimizer=optimizer_qr_r,
+            num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+            num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        )
+
+    if args.factorization == 'kron_qr':
+        if args.train_text_encoder:
+            (
+                unet,
+                text_encoder,
+                optimizer_kron_1, optimizer_kron_2, optimizer_qr_r,
+                train_dataloader,
+                lr_scheduler_kron_1, lr_scheduler_kron_2, lr_scheduler_qr_r,
+            ) = accelerator.prepare(
+                unet,
+                text_encoder,
+                optimizer_kron_1, optimizer_kron_2, optimizer_qr_r,
+                train_dataloader,
+                lr_scheduler_kron_1, lr_scheduler_kron_2, lr_scheduler_qr_r
+            )
+        else:
+            (
+                unet,
+                optimizer_kron_1, optimizer_kron_2, optimizer_qr_r,
+                train_dataloader,
+                lr_scheduler_kron_1, lr_scheduler_kron_2, lr_scheduler_qr_r
+            ) = accelerator.prepare(
+                unet,
+                optimizer_kron_1, optimizer_kron_2, optimizer_qr_r,
+                train_dataloader,
+                lr_scheduler_kron_1, lr_scheduler_kron_2, lr_scheduler_qr_r
+            )
+
+    if args.factorization == 'qr':
+        if args.train_text_encoder:
+            (
+                unet,
+                text_encoder,
+                optimizer_qr_q, optimizer_qr_r,
+                train_dataloader,
+                lr_scheduler_qr_q, lr_scheduler_qr_r,
+            ) = accelerator.prepare(
+                unet,
+                text_encoder,
+                optimizer_qr_q, optimizer_qr_r,
+                train_dataloader,
+                lr_scheduler_qr_q, lr_scheduler_qr_r,
+            )
+        else:
+            (
+                unet,
+                optimizer_qr_q, optimizer_qr_r,
+                train_dataloader,
+                lr_scheduler_qr_q, lr_scheduler_qr_r,
+            ) = accelerator.prepare(
+                unet,
+                optimizer_qr_q, optimizer_qr_r,
+                train_dataloader,
+                lr_scheduler_qr_q, lr_scheduler_qr_r,
+            )
 
     weight_dtype = torch.float32
     if accelerator.mixed_precision == "fp16":
@@ -1097,122 +1362,8 @@ def main(args):
             ).latent_dist.sample()
             latents = latents * 0.18215
 
-            # # Sample noise that we'll add to the latents
-            # noise = torch.randn_like(latents)
-            # bsz = latents.shape[0]
-            # # Sample a random timestep for each image
-            # timesteps = torch.randint(
-            #     0,
-            #     noise_scheduler.config.num_train_timesteps,
-            #     (bsz,),
-            #     device=latents.device,
-            # )
-            # timesteps = timesteps.long()
 
-            # # Add noise to the latents according to the noise magnitude at each timestep
-            # # (this is the forward diffusion process)
-            # noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-            # # Get the text embedding for conditioning
-            # encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-
-            # # Predict the noise residual
-            # model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-
-            # # Get the target for loss depending on the prediction type
-            # if noise_scheduler.config.prediction_type == "epsilon":
-            #     target = noise
-            # elif noise_scheduler.config.prediction_type == "v_prediction":
-            #     target = noise_scheduler.get_velocity(latents, noise, timesteps)
-            # else:
-            #     raise ValueError(
-            #         f"Unknown prediction type {noise_scheduler.config.prediction_type}"
-            #     )
-
-            # if args.with_prior_preservation:
-            #     # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-            #     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
-            #     target, target_prior = torch.chunk(target, 2, dim=0)
-
-            #     # Compute instance loss
-            #     loss = (
-            #         F.mse_loss(model_pred.float(), target.float(), reduction="none")
-            #         .mean([1, 2, 3])
-            #         .mean()
-            #     )
-
-            #     # Compute prior loss
-            #     prior_loss = F.mse_loss(
-            #         model_pred_prior.float(), target_prior.float(), reduction="mean"
-            #     )
-
-            #     # Add the prior loss to the instance loss.
-            #     loss = loss + args.prior_loss_weight * prior_loss
-            # else:
-            #     loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-
-            if args.how_to_optimize == "sam":
-                enable_running_stats(unet)
-                enable_running_stats(text_encoder)
-                loss, prior_loss = p_loss(args, unet, text_encoder, latents, batch["input_ids"], noise_scheduler)
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(unet.parameters(), text_encoder.parameters())
-                        if args.train_text_encoder
-                        else unet.parameters()
-                    )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                if not args.sam_down_only:
-                    optimizer_up.optimizer.first_step(zero_grad=True)
-                if not args.freeze_down:
-                    optimizer_down.optimizer.first_step(zero_grad=True)
-
-                disable_running_stats(unet)
-                disable_running_stats(text_encoder)
-                loss, prior_loss = p_loss(args, unet, text_encoder, latents, batch["input_ids"], noise_scheduler)
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(unet.parameters(), text_encoder.parameters())
-                        if args.train_text_encoder
-                        else unet.parameters()
-                    )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                optimizer_up.optimizer.second_step(zero_grad=True)
-                if not args.freeze_down:
-                    optimizer_down.optimizer.second_step(zero_grad=True)
-
-            elif args.how_to_optimize == "minimax" or args.how_to_optimize == "minimax2":
-
-                loss, prior_loss = p_loss(args, unet, text_encoder, latents, batch["input_ids"], noise_scheduler)
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(unet.parameters(), text_encoder.parameters())
-                        if args.train_text_encoder
-                        else unet.parameters()
-                    )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                optimizer_up.step()
-                optimizer_up.zero_grad()
-                if args.how_to_optimize == "minimax2":
-                    optimizer_down.step()
-                    optimizer_down.zero_grad()
-                
-                loss, prior_loss = p_loss(args, unet, text_encoder, latents, batch["input_ids"], noise_scheduler)
-                accelerator.backward(-loss)
-                if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(unet.parameters(), text_encoder.parameters())
-                        if args.train_text_encoder
-                        else unet.parameters()
-                    )
-                    accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                optimizer_down.step()
-                optimizer_down.zero_grad()
-
-            elif args.how_to_optimize == "minimize":
+            if args.how_to_optimize == "minimize":
                 loss, prior_loss = p_loss(args, unet, text_encoder, latents, batch["input_ids"], noise_scheduler)
                 # accelerator.backward(loss + args.prior_loss_weight * prior_loss)
                 accelerator.backward(loss)
@@ -1223,18 +1374,43 @@ def main(args):
                         else unet.parameters()
                     )
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
-                optimizer_up.step()
-                if not args.freeze_down:
-                    optimizer_down.step()
-                optimizer_up.zero_grad()
-                optimizer_down.zero_grad()
+                if args.factorization == 'kron_qr':
+                    optimizer_kron_1.step()
+                    optimizer_kron_2.step()
+                    optimizer_qr_r.step()
+                if args.factorization == 'qr':
+                    optimizer_qr_q.step()
+                    optimizer_qr_r.step()
 
-            lr_scheduler_up.step()
-            lr_scheduler_down.step()
+                if args.triangle_down:
+                    for param in unet_qr_params_qr_r_list + text_encoder_qr_params_qr_r_list:
+                        with torch.no_grad():
+                            upper_band_mask = torch.triu(torch.ones_like(param), diagonal=0)
+                            lower_band_mask = torch.tril(torch.ones_like(param), diagonal=args.size_qr_r)
+                            param.copy_(param * upper_band_mask * lower_band_mask)
+                print(param)
+
+                if args.factorization == 'kron_qr':
+                    optimizer_kron_1.zero_grad()
+                    optimizer_kron_2.zero_grad()
+                    optimizer_qr_r.zero_grad()
+                if args.factorization == 'qr':
+                    optimizer_qr_q.zero_grad()
+                    optimizer_qr_r.zero_grad()                                   
+
+            if args.factorization == 'kron_qr':
+                lr_scheduler_kron_1.step()
+                lr_scheduler_kron_2.step()
+                lr_scheduler_qr_r.step()
+            if args.factorization == 'qr':
+                lr_scheduler_qr_q.step()
+                lr_scheduler_qr_r.step()
+
             progress_bar.update(1)
             global_step += 1
 
             # Checks if the accelerator has performed an optimization step behind the scenes
+            '''
             if accelerator.sync_gradients:
                 if args.save_steps and global_step - last_save >= args.save_steps:
                     if accelerator.is_main_process:
@@ -1260,7 +1436,7 @@ def main(args):
                             ),
                             revision=args.revision,
                         )
-
+                        
                         filename_unet = (
                             f"{args.output_dir}/lora_weight_e{epoch}_s{global_step}.pt"
                         )
@@ -1277,11 +1453,11 @@ def main(args):
                         for _up, _down in extract_lora_ups_down(pipeline.unet):
                             print(
                                 "First Unet Layer's Up Weight is now : ",
-                                _up.weight.data,
+                                _up.weight.data, _up.weight.data.size(),
                             )
                             print(
                                 "First Unet Layer's Down Weight is now : ",
-                                _down.weight.data,
+                                _down.weight.data, _down.weight.data.size(),
                             )
                             break
                         if args.train_text_encoder:
@@ -1307,6 +1483,7 @@ def main(args):
 
             if global_step >= args.max_train_steps:
                 break
+            '''
 
     accelerator.wait_for_everyone()
 

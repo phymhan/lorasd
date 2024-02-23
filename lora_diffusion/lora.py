@@ -69,7 +69,71 @@ class LoraInjectedLinear(nn.Module):
             self.lora_up.weight.device
         ).to(self.lora_up.weight.dtype)
 
+class KronQRInjectedLinear(nn.Module):
+    def __init__(
+        self, in_features, out_features, bias=False, size_kron_1=4, dropout_p=0.1, scale=1.0
+    ):
+        super().__init__()
 
+        #if r > min(in_features, out_features):
+        #    raise ValueError(
+        #        f"LoRA rank {r} must be less or equal than {min(in_features, out_features)}"
+        #    )
+        #self.r = r
+        self.linear = nn.Linear(in_features, out_features, bias)
+        self.qr_r = nn.Linear(in_features, out_features, bias=False)
+        self.dropout = nn.Dropout(dropout_p)
+        # self.qr_q = nn.Linear(out_features, out_features, bias=False)
+        self.scale = scale
+
+        self.kron_1 = nn.Parameter(torch.empty(size_kron_1, size_kron_1))
+        self.kron_2 = nn.Parameter(torch.empty(out_features//size_kron_1, out_features//size_kron_1))
+        torch.nn.init.orthogonal_(self.kron_1)
+        torch.nn.init.orthogonal_(self.kron_2)
+        nn.init.zeros_(self.qr_r.weight)
+
+    def forward(self, input):
+        qr_q_weight = torch.kron(self.kron_1, self.kron_2)
+        out = F.linear(self.qr_r(input), qr_q_weight)
+        return (
+            self.linear(input)
+            + self.dropout(out)
+            * self.scale
+        )
+
+class QRInjectedLinear(nn.Module):
+    def __init__(
+        self, in_features, out_features, bias=False, dropout_p=0.1, scale=1.0
+    ):
+        super().__init__()
+
+        #if r > min(in_features, out_features):
+        #    raise ValueError(
+        #        f"LoRA rank {r} must be less or equal than {min(in_features, out_features)}"
+        #    )
+        #self.r = r
+        self.linear = nn.Linear(in_features, out_features, bias)
+        self.qr_r = nn.Linear(in_features, out_features, bias=False)
+        self.dropout = nn.Dropout(dropout_p)
+        self.qr_q = nn.Linear(out_features, out_features, bias=False)
+        self.scale = scale
+
+        linear_q, _ = torch.linalg.qr(self.linear.weight.detach(), mode='complete')
+        self.qr_q.weight = nn.Parameter(linear_q)
+        nn.init.zeros_(self.qr_r.weight)
+
+    def forward(self, input):
+        #print(f"input.shape:{input.shape}")
+        #print(f"qr_r(input).shape:{self.qr_r(input).shape}")
+        #print(f"qr_r.weight.shape:{self.qr_r.weight.shape}")
+        #print(f"qr_q.weight.shape:{self.qr_q.weight.shape}")
+        out = self.qr_q(self.qr_r(input))
+        return (
+            self.linear(input)
+            + self.dropout(out)
+            * self.scale
+        )
+    
 class LoraInjectedConv2d(nn.Module):
     def __init__(
         self,
@@ -308,6 +372,118 @@ def inject_trainable_lora(
 
     return require_grad_params, names
 
+def inject_trainable_kron_qr(
+    model: nn.Module,
+    target_replace_module: Set[str] = DEFAULT_TARGET_REPLACE,
+    size_kron_1: int = 4,
+    loras=None,  # path to lora .pt
+    verbose: bool = False,
+    dropout_p: float = 0.0,
+    scale: float = 1.0,
+):
+    """
+    inject lora into model, and returns lora parameter groups.
+    """
+
+    require_grad_params = []
+    names = []
+
+    if loras != None:
+        loras = torch.load(loras)
+
+    for _module, name, _child_module in _find_modules(
+        model, target_replace_module, search_class=[nn.Linear]
+    ):
+        weight = _child_module.weight
+        bias = _child_module.bias
+        if verbose:
+            print("LoRA Injection : injecting lora into ", name)
+            print("LoRA Injection : weight shape", weight.shape)
+        _tmp = KronQRInjectedLinear(
+            _child_module.in_features,
+            _child_module.out_features,
+            _child_module.bias is not None,
+            size_kron_1=size_kron_1,
+            dropout_p=dropout_p,
+            scale=scale,
+        )
+        _tmp.linear.weight = weight
+        if bias is not None:
+            _tmp.linear.bias = bias
+
+        # switch the module
+        _tmp.to(_child_module.weight.device).to(_child_module.weight.dtype)
+        _module._modules[name] = _tmp
+
+        require_grad_params.append([_module._modules[name].kron_1])
+        require_grad_params.append([_module._modules[name].kron_2])
+        require_grad_params.append(_module._modules[name].qr_r.parameters())
+
+        if loras != None:
+            _module._modules[name].kron_1 = loras.pop(0)
+            _module._modules[name].kron_2 = loras.pop(0)
+            _module._modules[name].qr_r.weight = loras.pop(0)
+
+        _module._modules[name].kron_1.requires_grad = True
+        _module._modules[name].kron_2.requires_grad = True
+        _module._modules[name].qr_r.weight.requires_grad = True
+        names.append(name)
+
+    return require_grad_params, names
+
+def inject_trainable_qr(
+    model: nn.Module,
+    target_replace_module: Set[str] = DEFAULT_TARGET_REPLACE,
+    loras=None,  # path to lora .pt
+    verbose: bool = False,
+    dropout_p: float = 0.0,
+    scale: float = 1.0,
+):
+    """
+    inject lora into model, and returns lora parameter groups.
+    """
+
+    require_grad_params = []
+    names = []
+
+    if loras != None:
+        loras = torch.load(loras)
+
+    for _module, name, _child_module in _find_modules(
+        model, target_replace_module, search_class=[nn.Linear]
+    ):
+        weight = _child_module.weight
+        bias = _child_module.bias
+        if verbose:
+            print("LoRA Injection : injecting lora into ", name)
+            print("LoRA Injection : weight shape", weight.shape)
+        _tmp = QRInjectedLinear(
+            _child_module.in_features,
+            _child_module.out_features,
+            _child_module.bias is not None,
+            dropout_p=dropout_p,
+            scale=scale,
+        )
+        _tmp.linear.weight = weight
+        if bias is not None:
+            _tmp.linear.bias = bias
+
+        # switch the module
+        _tmp.to(_child_module.weight.device).to(_child_module.weight.dtype)
+        _module._modules[name] = _tmp
+
+        require_grad_params.append(_module._modules[name].qr_q.parameters())
+        require_grad_params.append(_module._modules[name].qr_r.parameters())
+
+        if loras != None:
+            _module._modules[name].qr_q.weight = loras.pop(0)
+            _module._modules[name].qr_r.weight = loras.pop(0)
+
+        _module._modules[name].qr_q.weight.requires_grad = True
+        _module._modules[name].qr_r.weight.requires_grad = True
+        names.append(name)
+
+    return require_grad_params, names
 
 def inject_trainable_lora_extended(
     model: nn.Module,
